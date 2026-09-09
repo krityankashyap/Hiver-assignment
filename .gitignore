@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Data files — the actual datasets live on disk but are NOT committed.
+# Only the instructions/code to fetch them (data/download.sh, etc.) are tracked.
+data/**/*.csv
+data/**/*.csv.gz
+data/**/*.zip
+data/**/*.parquet
+data/archive/
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+.ipynb_checkpoints/
