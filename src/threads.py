@@ -106,3 +106,120 @@ def _clean(text: str) -> str:
     return _WS.sub(" ", text).strip()
 
 
+def _root_ids(df: pd.DataFrame) -> dict[int, int]:
+    """Map every tweet_id -> the root tweet_id of its conversation.
+
+    Follows in_response_to_tweet_id up to the tweet with no parent, memoizing
+    along the way so the whole dataset is resolved in one near-linear pass.
+    """
+    parent = dict(
+        zip(
+            df["tweet_id"].tolist(),
+            df["in_response_to_tweet_id"].tolist(),  # may contain <NA>
+        )
+    )
+    root: dict[int, int] = {}
+    for tid in parent:
+        # walk up, collecting the chain, until we hit a known root / missing parent
+        chain = []
+        cur = tid
+        while cur in root:  # already resolved
+            break
+        while True:
+            if cur in root:
+                r = root[cur]
+                break
+            chain.append(cur)
+            p = parent.get(cur)
+            if p is None or pd.isna(p) or p not in parent:
+                r = cur  # no (in-dataset) parent -> this is the root
+                break
+            cur = int(p)
+        for c in chain:
+            root[c] = r
+    return root
+
+
+def build_pairs(df: pd.DataFrame, brand: str) -> pd.DataFrame:
+    # lookups by tweet_id
+    idx = df.set_index("tweet_id")
+    text_by_id = idx["text"]
+    inbound_by_id = idx["inbound"]
+
+    # every reply the brand sent
+    brand_replies = df[(df["author_id"] == brand) & (~df["inbound"].fillna(False))]
+    if brand_replies.empty:
+        raise SystemExit(
+            f"error: no brand replies found for '{brand}'. "
+            f"Run `python src/threads.py --rank` to see valid brand names."
+        )
+
+    parent_id = brand_replies["in_response_to_tweet_id"]
+    # keep replies whose parent exists and is a customer (inbound) message
+    has_parent = parent_id.notna()
+    br = brand_replies[has_parent].copy()
+    pid = br["in_response_to_tweet_id"].astype("int64")
+
+    parent_is_customer = pid.map(inbound_by_id).fillna(False).to_numpy()
+    br = br[parent_is_customer]
+    pid = pid[parent_is_customer]
+
+    customer_msg = pid.map(text_by_id).map(_clean).to_numpy()
+    brand_reply = br["text"].map(_clean).to_numpy()
+
+    root = _root_ids(df)
+    thread_id = [root.get(int(t), int(t)) for t in br["tweet_id"].to_numpy()]
+
+    out = pd.DataFrame(
+        {
+            "thread_id": thread_id,
+            "customer_tweet_id": pid.to_numpy(),
+            "brand_tweet_id": br["tweet_id"].to_numpy(),
+            "created_at": br["created_at"].to_numpy(),
+            "customer_msg": customer_msg,
+            "brand_reply": brand_reply,
+        }
+    )
+    # drop pairs where either side is empty after cleaning, and exact dups
+    out = out[(out["customer_msg"].str.len() > 0) & (out["brand_reply"].str.len() > 0)]
+    out = out.drop_duplicates(subset=["customer_tweet_id", "brand_tweet_id"])
+    out = out.reset_index(drop=True)
+    return out
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description=__doc__)
+    ap.add_argument("--input", type=Path, default=DEFAULT_INPUT)
+    ap.add_argument("--brand", type=str, help="brand author_id, e.g. AppleSupport")
+    ap.add_argument("--rank", action="store_true", help="list top brands and exit")
+    ap.add_argument("--output", type=Path, default=None)
+    args = ap.parse_args()
+
+    df = load(args.input)
+
+    if args.rank or not args.brand:
+        print("\nTop brands by reply volume:\n")
+        print(rank_brands(df).to_string(index=False))
+        if not args.brand:
+            print("\nRe-run with --brand <name> to build pairs.")
+            return
+
+    pairs = build_pairs(df, args.brand)
+    out_path = args.output or (OUT_DIR / f"{args.brand}_pairs.csv")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    pairs.to_csv(out_path, index=False)
+
+    n_threads = pairs["thread_id"].nunique()
+    print(
+        f"\n{args.brand}: {len(pairs):,} (customer -> brand) pairs "
+        f"across {n_threads:,} threads"
+    )
+    print(f"Wrote {out_path}")
+    print("\nSample:")
+    with pd.option_context("display.max_colwidth", 70):
+        print(pairs[["customer_msg", "brand_reply"]].head(5).to_string(index=False))
+
+
+if __name__ == "__main__":
+    main()
+
